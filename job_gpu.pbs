@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N amazon_ml_26_master_builders
+#PBS -q workq
+#PBS -l select=1:ncpus=7:ngpus=1:mem=32gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -o build_index_business_name_1.log
+
+cd $PBS_O_WORKDIR
+
+# Initialize Conda for the non-interactive PBS shell
+source /apps/compilers/anaconda3/etc/profile.d/conda.sh
+
+# Activate the specific environment
+conda activate amazon_ml_26
+
+# MIG SETUP (Required for H100)
+export CUDA_VISIBLE_DEVICES=MIG-98a11fbb-7fcd-5fc9-b30f-f199445f5ddb
+export FAISS_DATA_DIR="$HOME/amazon-ml-challenge-26/faiss_dir"
+export COLLECTION=business_name_1
+
+# Run GPU code using the environment's Python interpreter
+python3 index-creation.py
