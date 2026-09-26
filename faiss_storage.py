@@ -19,8 +19,6 @@ not require it. FAISS currently accepts float32 arrays for index operations;
 those conversions are temporary and do not change either persisted FP16 copy.
 """
 
-from __future__ import annotations
-
 import importlib
 import logging
 import os
@@ -30,7 +28,6 @@ import time
 import uuid
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Sequence
 
 import numpy as np
 
@@ -53,15 +50,15 @@ class FaissVectorStorage:
 
     def __init__(
         self,
-        directory: str | Path,
+        directory,
         *,
-        device: str = "auto",
-        gpu_id: int = 0,
-        nlist: int = 4096,
-        nprobe: int = 32,
-        training_size: int = 200_000,
-        add_batch_size: int = 8192,
-    ) -> None:
+        device="auto",
+        gpu_id=0,
+        nlist=4096,
+        nprobe=32,
+        training_size=200_000,
+        add_batch_size=8192,
+    ):
         if device not in {"auto", "cpu", "gpu"}:
             raise ValueError("device must be 'auto', 'cpu', or 'gpu'")
         if gpu_id < 0 or nlist < 1 or nprobe < 1 or training_size < 1 or add_batch_size < 1:
@@ -76,10 +73,10 @@ class FaissVectorStorage:
         self.training_size = training_size
         self.add_batch_size = add_batch_size
         # Retain GPU resources alongside each loaded index.
-        self._indexes: dict[str, tuple[Any, Any | None, int]] = {}
+        self._indexes = {}
         log.info("FAISS storage ready at %s (device=%s)", self.directory, device)
 
-    def missing_ids(self, name: str, ids: Sequence[str]) -> list[str]:
+    def missing_ids(self, name, ids):
         """Return IDs absent from the collection, preserving input order."""
         ids_list = self._check_ids(ids)
         if not ids_list:
@@ -92,9 +89,7 @@ class FaissVectorStorage:
             existing = self._rows_for_ids(connection, ids_list)
         return [item_id for item_id in ids_list if item_id not in existing]
 
-    def store_embeddings(
-        self, name: str, ids: Sequence[str], embeddings: np.ndarray
-    ) -> int:
+    def store_embeddings(self, name, ids, embeddings):
         """Append new FP16 vectors; return the number added.
 
         Existing IDs with identical FP16 vectors are skipped. An existing ID
@@ -110,8 +105,8 @@ class FaissVectorStorage:
         if not ids_list:
             return 0
 
-        first_positions: dict[str, int] = {}
-        unique_positions: list[int] = []
+        first_positions = {}
+        unique_positions = []
         for position, item_id in enumerate(ids_list):
             first = first_positions.setdefault(item_id, position)
             if first == position:
@@ -218,7 +213,7 @@ class FaissVectorStorage:
         )
         return len(new_positions)
 
-    def get_embeddings(self, name: str, ids: Sequence[str]) -> np.ndarray:
+    def get_embeddings(self, name, ids):
         """Fetch exact saved FP16 vectors by ID in request order.
 
         Raises ``KeyError`` when any requested ID is missing.
@@ -250,7 +245,7 @@ class FaissVectorStorage:
         log.info("Fetched %d FP16 vectors by ID from %s", len(ids_list), name)
         return result
 
-    def build_index(self, name: str) -> int:
+    def build_index(self, name):
         """Train or extend the persistent IVF/SQfp16 index; return its size.
 
         A partially written temporary index is ignored on the next call. The
@@ -359,16 +354,12 @@ class FaissVectorStorage:
         )
         return count
 
-    def search_similar(
-        self, name: str, query_vector: np.ndarray, k: int = 10, *, nprobe: int | None = None
-    ) -> list[tuple[str, float]]:
+    def search_similar(self, name, query_vector, k=10, *, nprobe=None):
         """Return the top-k ``(ID, inner-product score)`` matches for one vector."""
         query = self._check_vectors(query_vector, ndim=1)
         return self.search_similar_batch(name, query[np.newaxis, :], k, nprobe=nprobe)[0]
 
-    def search_similar_batch(
-        self, name: str, query_vectors: np.ndarray, k: int = 10, *, nprobe: int | None = None
-    ) -> list[list[tuple[str, float]]]:
+    def search_similar_batch(self, name, query_vectors, k=10, *, nprobe=None):
         """Search many FP16 queries together and return matches per query."""
         queries = self._check_vectors(query_vectors, ndim=2)
         if k < 1 or k > 1024:
@@ -415,7 +406,7 @@ class FaissVectorStorage:
         )
         return result
 
-    def _search_index(self, name: str) -> tuple[Any, int, Path]:
+    def _search_index(self, name):
         collection = self._collection(name)
         db_path = collection / "ids.sqlite3"
         index_path = collection / "index.faiss"
@@ -442,20 +433,20 @@ class FaissVectorStorage:
         log.info("Loaded %s index with %d vectors on %s", name, count, device)
         return index, dimension, db_path
 
-    def _collection(self, name: str) -> Path:
+    def _collection(self, name):
         if not isinstance(name, str) or not _NAME_PATTERN.fullmatch(name):
             raise ValueError("collection name must contain only letters, digits, '_' or '-'")
         return self.directory / name
 
     @staticmethod
-    def _check_ids(ids: Sequence[str]) -> list[str]:
+    def _check_ids(ids):
         result = list(ids)
         if any(not isinstance(item_id, str) or not item_id for item_id in result):
             raise ValueError("all IDs must be nonempty strings")
         return result
 
     @staticmethod
-    def _check_vectors(vectors: np.ndarray, *, ndim: int) -> np.ndarray:
+    def _check_vectors(vectors, *, ndim):
         result = np.asarray(vectors)
         if result.dtype != np.float16 or result.ndim != ndim:
             raise ValueError(f"vectors must be a {ndim}D numpy.float16 array")
@@ -464,7 +455,7 @@ class FaissVectorStorage:
         return result
 
     @staticmethod
-    def _state(connection: sqlite3.Connection, raw_path: Path) -> tuple[int, int]:
+    def _state(connection, raw_path):
         found = connection.execute(
             "SELECT value FROM metadata WHERE key = 'dimension'"
         ).fetchone()
@@ -486,7 +477,7 @@ class FaissVectorStorage:
         return dimension, count
 
     @staticmethod
-    def _trim_uncommitted_tail(raw_path: Path, expected_bytes: int) -> None:
+    def _trim_uncommitted_tail(raw_path, expected_bytes):
         if not raw_path.exists():
             return
         actual_bytes = raw_path.stat().st_size
@@ -502,10 +493,8 @@ class FaissVectorStorage:
             )
 
     @staticmethod
-    def _rows_for_ids(
-        connection: sqlite3.Connection, ids: Sequence[str]
-    ) -> dict[str, int]:
-        rows: dict[str, int] = {}
+    def _rows_for_ids(connection, ids):
+        rows = {}
         for first in range(0, len(ids), _SQL_BATCH_SIZE):
             chunk = ids[first : first + _SQL_BATCH_SIZE]
             placeholders = ",".join("?" for _ in chunk)
@@ -514,10 +503,8 @@ class FaissVectorStorage:
         return rows
 
     @staticmethod
-    def _ids_for_rows(
-        connection: sqlite3.Connection, rows: Sequence[int]
-    ) -> dict[int, str]:
-        ids: dict[int, str] = {}
+    def _ids_for_rows(connection, rows):
+        ids = {}
         for first in range(0, len(rows), _SQL_BATCH_SIZE):
             chunk = rows[first : first + _SQL_BATCH_SIZE]
             placeholders = ",".join("?" for _ in chunk)
@@ -526,7 +513,7 @@ class FaissVectorStorage:
         return ids
 
     @staticmethod
-    def _faiss() -> Any:
+    def _faiss():
         try:
             return importlib.import_module("faiss")
         except ImportError as error:
@@ -535,7 +522,7 @@ class FaissVectorStorage:
                 "install a compatible faiss-cpu or faiss-gpu package"
             ) from error
 
-    def _resolved_device(self, faiss: Any) -> str:
+    def _resolved_device(self, faiss):
         if self.device == "cpu":
             return "cpu"
         supported = all(
@@ -554,14 +541,14 @@ class FaissVectorStorage:
             )
         return "cpu"
 
-    def _to_device(self, faiss: Any, cpu_index: Any, device: str) -> tuple[Any, Any | None]:
+    def _to_device(self, faiss, cpu_index, device):
         if device == "cpu":
             return cpu_index, None
         resources = faiss.StandardGpuResources()
         return faiss.index_cpu_to_gpu(resources, self.gpu_id, cpu_index), resources
 
     @staticmethod
-    def _check_index(faiss: Any, index: Any, dimension: int, count: int) -> None:
+    def _check_index(faiss, index, dimension, count):
         if (
             not isinstance(index, faiss.IndexIVFScalarQuantizer)
             or int(index.d) != dimension
