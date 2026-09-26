@@ -15,8 +15,9 @@ Example::
     saved = store.get_embeddings("business_name_1", ["S1-123"])
 
 FAISS is imported only for indexing and search. FP16 writes and ID lookups do
-not require it. FAISS currently accepts float32 arrays for index operations;
-those conversions are temporary and do not change either persisted FP16 copy.
+not require it. CPU index operations use temporary float32 arrays; GPU index
+building transfers FP16 tensors and converts them to float32 on CUDA. Neither
+path changes the persisted FP16 vectors.
 """
 
 import importlib
@@ -26,7 +27,7 @@ import re
 import sqlite3
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -305,28 +306,77 @@ class FaissVectorStorage:
                 device,
             )
 
+        if device == "gpu":
+            torch, cuda_device = self._gpu_tensor_support()
+            log.info(
+                "Building %s using CUDA tensor data path on %s: "
+                "stored dtype=float16, transfer dtype=float16, FAISS input dtype=float32",
+                name,
+                cuda_device,
+            )
+
         index, resources = self._to_device(faiss, cpu_index, device)
+        if device == "gpu" and (
+            not hasattr(index, "getDevice")
+            or int(index.getDevice()) != self.gpu_id
+            or not any(
+                all(hasattr(index, method) for method in methods)
+                for methods in (("train_ex", "add_with_ids_ex"), ("train_c", "add_with_ids_c"))
+            )
+        ):
+            raise RuntimeError(
+                "FAISS GPU index does not support CUDA tensor train/add_with_ids "
+                f"on device {self.gpu_id}"
+            )
         saved = np.memmap(
             raw_path, dtype=_FP16_DISK_DTYPE, mode="r", shape=(count, dimension)
         )
-        if not index.is_trained:
-            sample_count = min(count, self.training_size)
-            if sample_count == count:
-                sample_rows = np.arange(count)
-            else:
-                sample_rows = np.sort(
-                    np.random.default_rng(0).choice(count, size=sample_count, replace=False)
-                )
-            sample = np.ascontiguousarray(saved[sample_rows], dtype=np.float32)
-            index.train(sample)
-            del sample
-            log.info("Trained %s index on %d sampled vectors", name, sample_count)
+        # torch_utils uses the current PyTorch stream for FAISS GPU operations.
+        # Select the same logical CUDA device as index_cpu_to_gpu above.
+        with torch.cuda.device(cuda_device) if device == "gpu" else nullcontext():
+            if not index.is_trained:
+                if sample_count == count:
+                    sample_vectors = saved
+                else:
+                    sample_rows = np.sort(
+                        np.random.default_rng(0).choice(count, size=sample_count, replace=False)
+                    )
+                    sample_vectors = saved[sample_rows]
+                if device == "gpu":
+                    log.info(
+                        "Training FAISS GPU index on %d vectors using GPU-side "
+                        "FP16->FP32 conversion",
+                        sample_count,
+                    )
+                    sample_gpu_fp32 = self._fp16_numpy_to_cuda_fp32(
+                        torch, sample_vectors, cuda_device
+                    )
+                    index.train(sample_gpu_fp32)
+                    del sample_gpu_fp32
+                else:
+                    sample = np.ascontiguousarray(sample_vectors, dtype=np.float32)
+                    index.train(sample)
+                    del sample
+                del sample_vectors
+                log.info("Trained %s index on %d sampled vectors", name, sample_count)
 
-        for first in range(start_row, count, self.add_batch_size):
-            last = min(first + self.add_batch_size, count)
-            batch = np.ascontiguousarray(saved[first:last], dtype=np.float32)
-            labels = np.arange(first, last, dtype=np.int64)
-            index.add_with_ids(batch, labels)
+            for first in range(start_row, count, self.add_batch_size):
+                last = min(first + self.add_batch_size, count)
+                if device == "gpu":
+                    batch_gpu_fp32 = self._fp16_numpy_to_cuda_fp32(
+                        torch, saved[first:last], cuda_device
+                    )
+                    labels_gpu = torch.arange(
+                        first, last, dtype=torch.int64, device=cuda_device
+                    )
+                    index.add_with_ids(batch_gpu_fp32, labels_gpu)
+                    del batch_gpu_fp32, labels_gpu
+                else:
+                    batch = np.ascontiguousarray(saved[first:last], dtype=np.float32)
+                    labels = np.arange(first, last, dtype=np.int64)
+                    index.add_with_ids(batch, labels)
+            if device == "gpu":
+                torch.cuda.synchronize(cuda_device)
         del saved
         if int(index.ntotal) != count:
             raise RuntimeError(
@@ -546,6 +596,40 @@ class FaissVectorStorage:
             return cpu_index, None
         resources = faiss.StandardGpuResources()
         return faiss.index_cpu_to_gpu(resources, self.gpu_id, cpu_index), resources
+
+    def _gpu_tensor_support(self):
+        """Load the optional CUDA tensor bridge only for GPU index building."""
+        try:
+            torch = importlib.import_module("torch")
+            importlib.import_module("faiss.contrib.torch_utils")
+        except Exception as error:
+            raise RuntimeError(
+                "GPU-optimized index building requires compatible CUDA PyTorch "
+                "and faiss.contrib.torch_utils; no CPU FP32 fallback is used"
+            ) from error
+
+        try:
+            cuda_device = torch.device(f"cuda:{self.gpu_id}")
+            with torch.cuda.device(cuda_device):
+                torch.empty(0, dtype=torch.float16, device=cuda_device)
+        except Exception as error:
+            raise RuntimeError(
+                f"GPU-optimized index building cannot initialize PyTorch on cuda:{self.gpu_id}"
+            ) from error
+        return torch, cuda_device
+
+    @staticmethod
+    def _fp16_numpy_to_cuda_fp32(torch, vectors, cuda_device):
+        """Transfer FP16 to CUDA before converting it to FAISS input FP32."""
+        fp16_array = np.ascontiguousarray(vectors, dtype=np.float16)
+        if not fp16_array.flags.writeable:
+            # torch.from_numpy cannot safely wrap the read-only memmap view.
+            fp16_array = fp16_array.copy()
+        cpu_fp16 = torch.from_numpy(fp16_array)
+        cuda_fp16 = cpu_fp16.to(device=cuda_device)
+        cuda_fp32 = cuda_fp16.float()
+        del cuda_fp16, cpu_fp16
+        return cuda_fp32
 
     @staticmethod
     def _check_index(faiss, index, dimension, count):
